@@ -344,7 +344,7 @@ def _init_logfire(token: str) -> None:
     if st.session_state.get("_lf_token") == token:
         return  # already configured for this token
     try:
-        logfire.configure(token=token)
+        logfire.configure(token=token, service_name="NeMo Guardrails Demo")
         st.session_state["_lf_token"]  = token
         st.session_state["_lf_ready"]  = True
         st.session_state["_lf_status"] = "Connected & Tracing"
@@ -524,28 +524,29 @@ def render_experiment(exp_num: int):
 
         with st.chat_message("assistant"):
             with st.spinner("Processing through rails…"):
-                try:
-                    if exp_num == 1:
-                        with lf_span("raw_llm_call", model=chat_model, user_message=user_input):
-                            bot_msg, ms = infer_raw(user_input)
-                    else:
-                        with lf_span("guarded_rail_call", exp_num=exp_num, guard_model=guard_model, user_message=user_input, rails=str(RAILS_STACKED[exp_num])):
-                            bot_msg, ms = infer_guarded(exp_num, user_input)
+                with lf_span("chat_interaction", exp_num=exp_num, user_message=user_input, session_id=st.session_state.get("session_id", "")):
+                    try:
+                        if exp_num == 1:
+                            with lf_span("raw_llm_call", model=chat_model):
+                                bot_msg, ms = infer_raw(user_input)
+                        else:
+                            with lf_span("guarded_rail_call", exp_num=exp_num, guard_model=guard_model, rails=str(RAILS_STACKED[exp_num])):
+                                bot_msg, ms = infer_guarded(exp_num, user_input)
 
-                    if st.session_state.get("_lf_ready"):
-                        logfire.info("response_sent", exp_num=exp_num, latency_ms=ms, response_preview=bot_msg[:200])
+                        if st.session_state.get("_lf_ready"):
+                            logfire.info("response_sent", exp_num=exp_num, latency_ms=ms, response_preview=bot_msg[:200])
 
-                    st.write(bot_msg)
-                    st.caption(f"⏱ {ms} ms")
-                    st.session_state[chat_key].append(
-                        {"role": "assistant", "content": bot_msg, "ms": ms}
-                    )
-                except Exception as e:
-                    if st.session_state.get("_lf_ready"):
-                        logfire.error("chat_error", exp_num=exp_num, error=str(e))
-                    st.error(f"**{type(e).__name__}:** {e}")
-                    with st.expander("Full traceback"):
-                        st.code(traceback.format_exc())
+                        st.write(bot_msg)
+                        st.caption(f"⏱ {ms} ms")
+                        st.session_state[chat_key].append(
+                            {"role": "assistant", "content": bot_msg, "ms": ms}
+                        )
+                    except Exception as e:
+                        if st.session_state.get("_lf_ready"):
+                            logfire.error("chat_error", exp_num=exp_num, error=str(e))
+                        st.error(f"**{type(e).__name__}:** {e}")
+                        with st.expander("Full traceback"):
+                            st.code(traceback.format_exc())
 
     if st.session_state[chat_key]:
         if st.button("🗑 Clear chat", key=f"clr_{exp_num}"):
