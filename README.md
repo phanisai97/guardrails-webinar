@@ -130,6 +130,46 @@ define flow handle off topic
 
 ---
 
+## How Intent Matching Actually Works — FastEmbed
+
+When NeMo loads your Colang, it does not send your example sentences to any API. Instead it runs them through **FastEmbed** — a lightweight local embedding library by Qdrant — to convert each sentence into a vector (a list of numbers representing meaning).
+
+```
+define user ask off topic
+  "tell me a joke"          →  [0.21, -0.83, 0.44, ...]
+  "what is the capital..."  →  [0.19, -0.80, 0.41, ...]
+  "write me a poem"         →  [0.22, -0.85, 0.46, ...]
+```
+
+When a real user message arrives, NeMo embeds it the same way and does a **cosine similarity search** against all stored example vectors:
+
+```mermaid
+flowchart LR
+    A([User: yo recommend\na Netflix show]) --> B[FastEmbed\nlocal CPU model]
+    B --> C[Vector\n0.20, -0.82, 0.43...]
+    C --> D{Cosine similarity\nagainst all examples}
+    D -->|closest cluster| E[ask off topic ✅]
+    D -->|no close match| F[no intent matched\npass to LLM]
+```
+
+**Why FastEmbed specifically:**
+
+| Property | Detail |
+|---|---|
+| Runs locally | No API call, no data leaves your machine |
+| CPU-only | No GPU required — works on any server |
+| Fast startup | Small quantised models load in seconds |
+| Qdrant-maintained | Same team behind the Qdrant vector database |
+
+**The two-step classification pipeline:**
+
+1. **FastEmbed** does the fast local similarity search to find candidate intents — cheap, offline
+2. **Guard LLM** (`llama-3.3-70b`) confirms the match with context — expensive, accurate
+
+FastEmbed narrows the field; the guard LLM makes the final call. This is why a stronger guard model catches more subtle jailbreaks — the embedding step alone isn't enough for adversarial inputs.
+
+---
+
 ## Two Ways to Load Colang Config
 
 ### Option A — From strings (notebooks, testing)
@@ -333,23 +373,101 @@ def query(request: QueryRequest):
 
 ## Framework Comparison
 
-| Framework | By | Approach | Best For |
-|---|---|---|---|
-| **NeMo Guardrails** | NVIDIA | Colang DSL + LLM classification | Enterprise dialog + complex flows |
-| **Guardrails AI** | Guardrails AI | Python validators + RAIL spec | Structured output validation |
-| **LlamaGuard** | Meta | Fine-tuned binary classifier | Fast safe/unsafe decision |
-| **Rebuff** | Rebuff | Embedding + heuristics | Prompt injection detection only |
-| **LangChain Callbacks** | LangChain | Python callbacks in chain | Lightweight custom logic |
-| **AWS Bedrock Guardrails** | AWS | Managed cloud service | AWS-native deployments |
+### At a Glance
 
-### Why NeMo for This System
+| Framework | By | Model | Deployment | Rule Language | Custom Logic | Output Validation | Cost |
+|---|---|---|---|---|---|---|---|
+| **NeMo Guardrails** | NVIDIA | Any (LLM-agnostic) | Self-hosted | Colang DSL | `@action` Python | ✅ Output rails | Free / OSS |
+| **Guardrails AI** | Guardrails AI | Any | Self-hosted or Cloud | RAIL / Python validators | ✅ Full Python | ✅ Structured output | Free OSS + paid cloud |
+| **AWS Bedrock Guardrails** | Amazon | Bedrock models only | AWS cloud (managed) | GUI / API config | ❌ No custom code | ✅ PII, toxicity | Pay per API call |
+| **Azure AI Content Safety** | Microsoft | Azure OpenAI only | Azure cloud (managed) | GUI / API config | ❌ No custom code | ✅ Categories | Pay per API call |
+| **LlamaGuard** | Meta | Fine-tuned Llama | Self-hosted | Prompt taxonomy | ❌ No custom code | ✅ Safe/Unsafe label | Free / OSS |
+| **Lakera Guard** | Lakera | Proprietary | Cloud API | API config | ❌ No custom code | ✅ Prompt injection | Paid SaaS |
+| **LangChain Callbacks** | LangChain | Any | Self-hosted | Pure Python | ✅ Full Python | ✅ Custom logic | Free / OSS |
 
-- **Semantic matching** — handles paraphrases automatically; no brittle keyword lists
-- **LLM-agnostic** — Groq today, NVIDIA tomorrow, local model on air-gap network next week
-- **Python actions** — plug in any logic: regex, ML models, database checks, escalation
-- **Dialog control** — define the full conversation structure, not just safety filters
-- **Privacy** — runs locally, no data sent to a third-party safety API
-- **Open source** — Apache 2.0, fully auditable
+---
+
+### Deep Dive
+
+#### NeMo Guardrails (NVIDIA)
+- **Approach:** Colang DSL + a second LLM call for semantic intent classification + Python `@action` hooks
+- **Strengths:** Full conversation flow control (not just safety), LLM-agnostic, composable rails, runs 100% locally
+- **Weaknesses:** Adds latency (second LLM call per message), requires learning Colang DSL, overkill for simple output filtering
+- **LLM support:** Any — Groq, OpenAI, local Ollama, NVIDIA NIM, HuggingFace
+- **Licence:** Apache 2.0
+
+#### Guardrails AI
+- **Approach:** Python `Validator` classes that wrap LLM calls and check structured outputs against a schema (RAIL spec)
+- **Strengths:** Best-in-class for **structured output validation** (JSON schemas, regex, type checks), huge validator library
+- **Weaknesses:** Primarily output-focused — less suited for conversation flow control or input intent routing
+- **LLM support:** Any via LangChain or direct SDK
+- **Licence:** Apache 2.0 (OSS) + paid hosted hub
+
+#### AWS Bedrock Guardrails
+- **Approach:** Fully managed AWS service — configure topic blocks, PII filters, toxicity thresholds via console or API
+- **Strengths:** Zero infrastructure, integrates natively with Bedrock agents, enterprise SLA, SOC2/HIPAA compliance out of the box
+- **Weaknesses:** **AWS and Bedrock models only** — cannot use with Groq, OpenAI, or self-hosted LLMs; no custom Python logic; GUI-only rule authoring
+- **LLM support:** Amazon Bedrock models only (Claude via Bedrock, Titan, etc.)
+- **Cost:** ~$0.75–$1.00 per 1,000 text units processed
+
+#### Azure AI Content Safety
+- **Approach:** REST API service for toxicity detection, PII, groundedness checking, and prompt shield
+- **Strengths:** Deep integration with Azure OpenAI Service, built-in prompt injection detection ("Prompt Shield"), enterprise compliance
+- **Weaknesses:** Azure ecosystem lock-in, no conversation flow control, no custom business logic
+- **LLM support:** Azure OpenAI only (GPT-4o, GPT-4, etc.)
+- **Cost:** Pay per 1,000 API calls (~$1–$2 per 1,000)
+
+#### LlamaGuard (Meta)
+- **Approach:** A fine-tuned Llama model trained as a binary safe/unsafe classifier against a defined policy taxonomy
+- **Strengths:** Single fast inference call (no DSL, no second LLM), open weights, good baseline for standard harm categories
+- **Weaknesses:** Fixed taxonomy — adding a custom category means fine-tuning. No conversation flow control. Returns safe/unsafe only, not a structured block message.
+- **LLM support:** Standalone model — sits alongside any LLM
+- **Licence:** Llama community licence (free for most use)
+
+#### Lakera Guard
+- **Approach:** Cloud API specifically trained to detect prompt injection, jailbreaks, and data exfiltration attempts
+- **Strengths:** Extremely fast (< 50ms), purpose-built for adversarial inputs, no self-hosting
+- **Weaknesses:** Paid SaaS — data leaves your infrastructure; no conversation flow control; no custom logic; prompt injection only
+- **Cost:** Paid plans, pricing on request
+
+---
+
+### Decision Guide
+
+```
+Need full conversation flow control (greetings, farewells, topic routing)?
+  → NeMo Guardrails
+
+Need to validate structured JSON output against a schema?
+  → Guardrails AI
+
+Already on AWS, need zero-infra, compliance-ready?
+  → Bedrock Guardrails
+
+Already on Azure with Azure OpenAI?
+  → Azure AI Content Safety
+
+Need a fast safe/unsafe classifier, no frills?
+  → LlamaGuard
+
+Need the best prompt injection detection as a drop-in API?
+  → Lakera Guard
+
+Need lightweight custom Python logic without a framework?
+  → LangChain Callbacks
+```
+
+### Why NeMo for This Project
+
+| Requirement | Why NeMo wins |
+|---|---|
+| Semantic intent matching | Handles paraphrases automatically — no brittle keyword lists |
+| LLM-agnostic | Groq today, NVIDIA NIM tomorrow, local model on an air-gapped network next week |
+| Custom Python logic | PII regex, urgency classifier, any code via `@action` |
+| Dialog flow control | Scripted greetings / farewells with zero LLM calls |
+| Privacy | Runs entirely locally — no user messages sent to a third-party safety API |
+| Composable stacking | Add or remove any rail independently without breaking others |
+| Open source | Apache 2.0, fully auditable, no vendor lock-in |
 
 ---
 
